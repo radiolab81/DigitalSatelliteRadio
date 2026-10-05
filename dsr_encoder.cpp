@@ -172,7 +172,7 @@ class AudioSource {
 // ----------------------------------------------------------------------------
 // Output sample format
 // ----------------------------------------------------------------------------
-enum class Format { CS16, CF32, REAL16 };
+enum class Format { CS16, CF32, REAL16, CS8 };
 
 // ----------------------------------------------------------------------------
 // The encoder proper
@@ -221,7 +221,7 @@ class Encoder {
       const char* p = std::strrchr(o_.out.c_str(), ':');
       int port = p ? std::atoi(p + 1) : 5000;
       // queue limit ~1.5 s of stream data per client
-      size_t bps = (o_.fmt == Format::CF32 ? 8 : o_.fmt == Format::CS16 ? 4 : 2) * size_t(o_.sps * kSymbolRate);
+      size_t bps = (o_.fmt == Format::CF32 ? 8 : o_.fmt == Format::CS16 ? 4 : 2) * size_t(o_.sps * kSymbolRate);   // cs8 and real16: 2 bytes/sample
       if (!bc_.start(port, bps * 3 / 2)) return 1;
       std::fprintf(stderr, "serving on 127.0.0.1:%d - decoders can connect/disconnect at any time\n", port);
       use_tcp_ = true;
@@ -377,7 +377,7 @@ class Encoder {
         shaper_.push(I, Q, oi, oq);
         for (int p = 0; p < o_.sps; ++p) put_sample(oi[p] * scale_, oq[p] * scale_);
       }
-      if (out_i16_.size() * 2 + out_f32_.size() * 4 >= (1u << 18)) flush();
+      if (out_i16_.size() * 2 + out_f32_.size() * 4 + out_i8_.size() >= (1u << 18)) flush();
     }
   }
 
@@ -386,6 +386,8 @@ class Encoder {
     switch (o_.fmt) {
       case Format::CS16:
         out_i16_.push_back(clip(i)); out_i16_.push_back(clip(q)); break;
+      case Format::CS8:                  // signed 8-bit I/Q (HackRF / SoapySDR "CS8"), full scale = +-127
+        out_i8_.push_back(clip8(i)); out_i8_.push_back(clip8(q)); break;
       case Format::CF32:
         out_f32_.push_back(i); out_f32_.push_back(q); break;
       case Format::REAL16: {             // IF = fs/4: I*cos(pi n/2) - Q*sin(pi n/2)
@@ -397,13 +399,20 @@ class Encoder {
     }
     ++sample_no_;
   }
+  // Quantise with rounding (truncation would add 6 dB more quantisation noise,
+  // which matters for 8 bit) and hard-limit at full scale.
   static int16_t clip(float v) {
     float x = v * 32767.f;
-    return static_cast<int16_t>(std::max(-32767.f, std::min(32767.f, x)));
+    return static_cast<int16_t>(std::lrintf(std::max(-32767.f, std::min(32767.f, x))));
+  }
+  static int8_t clip8(float v) {
+    float x = v * 127.f;
+    return static_cast<int8_t>(std::lrintf(std::max(-127.f, std::min(127.f, x))));
   }
 
   void flush() {
     if (!out_i16_.empty()) { put(out_i16_.data(), out_i16_.size() * 2); out_i16_.clear(); }
+    if (!out_i8_.empty()) { put(out_i8_.data(), out_i8_.size()); out_i8_.clear(); }
     if (!out_f32_.empty()) { put(out_f32_.data(), out_f32_.size() * 4); out_f32_.clear(); }
   }
   void put(const void* d, size_t n) {
@@ -427,6 +436,7 @@ class Encoder {
   u16 sa_sync_ = kSync1;
   std::vector<int16_t> out_i16_;
   std::vector<float> out_f32_;
+  std::vector<int8_t> out_i8_;
 };
 
 static void usage() {
@@ -438,7 +448,7 @@ static void usage() {
       "  -p, --pty N=T[/S]     programme type 0..15 (and optional sub type)\n"
       "  -m, --kind N=music|speech   speech/music flag (default music)\n"
       "  -o, --output OUT      file, '-' (stdout) or tcp://127.0.0.1:PORT (server)\n"
-      "  -f, --format F        cs16 (default) | cf32 | real16 (IF = fs/4)\n"
+      "  -f, --format F        cs16 (default) | cs8 | cf32 | real16 (IF = fs/4)\n"
       "      --sps K           samples per symbol: 2 (20.48 MS/s, default), 4, 8;\n"
       "                        real16 needs 4 or 8 (default 4)\n"
       "      --realtime / --no-realtime   pace output at real time (default: on for\n"
@@ -490,7 +500,7 @@ int main(int argc, char** argv) {
       case 'o': o.out = optarg; break;
       case 'f': {
         std::string f = optarg;
-        o.fmt = f == "cf32" ? Format::CF32 : f == "real16" ? Format::REAL16 : Format::CS16;
+        o.fmt = f == "cf32" ? Format::CF32 : f == "real16" ? Format::REAL16 : f == "cs8" ? Format::CS8 : Format::CS16;
         break;
       }
       case 1000: o.sps = std::atoi(optarg); sps_set = 1; break;
@@ -519,7 +529,7 @@ int main(int argc, char** argv) {
   if (!o.realtime_set) o.realtime = (o.out == "-" || o.out.rfind("tcp://", 0) == 0);
 
   std::fprintf(stderr, "DSR encoder: %d station(s), %.2f MS/s, %s, %s\n", active,
-               o.sps * kSymbolRate / 1e6, o.fmt == Format::CS16 ? "cs16" : o.fmt == Format::CF32 ? "cf32" : "real16",
+               o.sps * kSymbolRate / 1e6, o.fmt == Format::CS16 ? "cs16" : o.fmt == Format::CF32 ? "cf32" : o.fmt == Format::CS8 ? "cs8" : "real16",
                o.realtime ? "real time" : "as fast as possible");
   Encoder enc(o);
   return enc.run();

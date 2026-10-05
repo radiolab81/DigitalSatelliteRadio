@@ -96,7 +96,8 @@ No external libraries; ffmpeg (inputs) and aplay (sound output) are used as prog
     # offline into a file, real IF at fs/4 (40.96 MS/s, int16)
     ./dsr_encoder -i 1=a.wav -f real16 -o dsr.s16
 
-Formats: `cs16` (I/Q int16), `cf32` (I/Q float), `real16` (IF = fs/4, sps 4 or 8).
+Formats: `cs16` (I/Q int16), `cs8` (I/Q signed int8, half the data rate), `cf32` (I/Q float),
+`real16` (IF = fs/4, sps 4 or 8).
 Stations 1..16; sources: any ffmpeg input, `tone:F[,F]`, `raw:PATH`.
 
 ## Decoder
@@ -149,6 +150,7 @@ DSR is a *wide-band* signal: even at the lowest sensible rate the baseband strea
 
 RAM is not an issue (a few tens of MB). Disk: a baseband **file** needs **82 MB per second**
 (about 5 GB per minute, 295 GB per hour) in the default `cs16` format - mind your free space!
+The `cs8` format halves this: 41 MB/s (about 2.5 GB per minute).
 
 ### What was measured
 Test machine: one core of an Intel Xeon VM at about 2.1 GHz, 16 active stations,
@@ -158,12 +160,33 @@ second of signal - **below 1.0 means real time is possible**:
 | Format (`-f`) | Samples/symbol | Sample rate | Encoder | Decoder |
 |---|---|---|---|---|
 | `cs16` (default) | 2 | 20.48 MS/s | 0.41 | 0.67 |
+| `cs8` | 2 | 20.48 MS/s | 0.41-0.47 | 0.67-0.80 (same as `cs16` within measurement noise) |
 | `cf32` | 2 | 20.48 MS/s | 0.64 | 0.71 |
 | `real16` | 4 | 40.96 MS/s | 0.54 | **1.09** (too slow for live use on this core) |
 
 Each station's ffmpeg process (MP3/AAC decoding and resampling) adds roughly 1-3 % of a
 core; 16 live internet streams add a few tens of percent in total.
 Raspberry Pi is an *estimate*, not a measurement!
+
+### The 8-bit format (`cs8`)
+`-f cs8` writes signed 8-bit I/Q (full scale +-127, the "CS8" format of HackRF / SoapySDR tools).
+It **halves the data rate** (41 MB/s: disk, TCP, memory bandwidth), but it does **not** reduce CPU
+load noticeably - the signal processing, not the data volume, is the bottleneck.
+
+Simulated quality results (16 stations, 1 s of signal, additive white noise, then 8-bit quantisation):
+
+| Item | Result |
+|---|---|
+| Quantisation SNR at the default `--amp 0.18` (about 23 LSB rms per component) | 38 dB (16 bit: 86 dB). QPSK needs only about 10 dB, so this is not limiting |
+| Decoded audio, clean channel | **bit-identical** to the `cs16` result |
+| Channel SNR 14 dB | no difference to 16 bit |
+| Channel SNR 10 dB / 8 dB | same number of corrected BCH words as 16 bit, **as long as the signal+noise level is at least about 0.08 of full scale rms** (about 10 LSB) |
+| Level too low (below about 0.04 of full scale, 5 LSB rms) | quantisation noise starts to hurt: at 8 dB SNR and 0.01 full scale the corrections rise from about 7,100 to 46,700 and a few blocks become uncorrectable |
+| Level too high (above about 0.5 of full scale rms) | clipping of 0.2-0.7 % of the samples, still decodable in the test |
+
+Rule of thumb: keep the I/Q signal at roughly **10-60 LSB rms** (0.08-0.5 of full scale). The encoder default
+is in the middle of this range. If you feed `cs8` from a real SDR receiver, adjust its gain until the level is
+in that range. 
 
 ### Check your own machine in 30 seconds
 ```bash
@@ -178,6 +201,7 @@ clearly less than 10 s** (say under 7 s) to be safe in real time. Running both a
 machine needs two free cores, so also look at your CPU load while they run.
 
 ### If it does not run smoothly
+* **Decoder does not stop on Ctrl-C:** fixed (it now checks for signals every 200 ms, also while waiting for data or reconnecting).
 * **Stuttering sound / gaps:** the decoder is too slow for your CPU. Close other programs,
   make sure you built with `make` (optimisation on) and did not copy a binary from another
   PC (`-march=native` binaries only run on the CPU family they were built on).

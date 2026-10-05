@@ -121,8 +121,11 @@ inline int tcp_listen_accept(int port) {
 }
 
 // TCP client; retries for `wait_s` seconds (the encoder may not be up yet).
-inline int tcp_connect(const std::string& host, int port, int wait_s = 30) {
+// `stop` (optional) aborts the wait, so Ctrl-C works while reconnecting.
+inline int tcp_connect(const std::string& host, int port, int wait_s = 30,
+                       const std::atomic<bool>* stop = nullptr) {
   for (int t = 0; t <= wait_s; ++t) {
+    if (stop && *stop) return -1;
     int s = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in a{};
     a.sin_family = AF_INET;
@@ -130,7 +133,10 @@ inline int tcp_connect(const std::string& host, int port, int wait_s = 30) {
     inet_pton(AF_INET, host.c_str(), &a.sin_addr);
     if (connect(s, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0) return s;
     close(s);
-    sleep(1);
+    for (int i = 0; i < 10; ++i) {              // 1 s in 100 ms steps, checking the stop flag
+      if (stop && *stop) return -1;
+      usleep(100000);
+    }
   }
   return -1;
 }

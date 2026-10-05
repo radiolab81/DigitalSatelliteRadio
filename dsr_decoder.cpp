@@ -538,7 +538,7 @@ static void usage() {
   std::printf(
       "dsr_decoder - Digital Satellite Radio (DSR) decoder\n\n"
       "  -i, --input SRC     file, '-' (stdin) or tcp://HOST:PORT\n"
-      "  -f, --format F      cs16 (default) | cf32 | real16\n"
+      "  -f, --format F      cs16 (default) | cs8 | cf32 | real16\n"
       "      --sps K         samples per symbol of the input: 2 (default), 4, 8\n"
       "  -s, --station N     programme to decode (1..16, default 1; changeable at run time)\n"
       "  -o, --wav FILE      write the programme to a 32 kHz stereo WAV file\n"
@@ -559,7 +559,7 @@ int main(int argc, char** argv) {
   std::string in = "dsr.cs16", wav, player;
   bool play = false, list = false, verbose = false;
   int control_port = 0;
-  int fmt = 0, sps = 2, station = 1;       // fmt: 0 cs16, 1 cf32, 2 real16
+  int fmt = 0, sps = 2, station = 1;       // fmt: 0 cs16, 1 cf32, 2 real16, 3 cs8
   static option lo[] = {{"input", 1, 0, 'i'}, {"format", 1, 0, 'f'}, {"sps", 1, 0, 1000},
                         {"station", 1, 0, 's'}, {"wav", 1, 0, 'o'}, {"play", 2, 0, 1001},
                         {"list", 0, 0, 1002}, {"control", 1, 0, 1003}, {"verbose", 0, 0, 'v'}, {"help", 0, 0, 'h'}, {0, 0, 0, 0}};
@@ -568,7 +568,7 @@ int main(int argc, char** argv) {
   while ((c = getopt_long(argc, argv, "i:f:s:o:vh", lo, nullptr)) != -1) {
     switch (c) {
       case 'i': in = optarg; break;
-      case 'f': fmt = !strcmp(optarg, "cf32") ? 1 : !strcmp(optarg, "real16") ? 2 : 0; break;
+      case 'f': fmt = !strcmp(optarg, "cf32") ? 1 : !strcmp(optarg, "real16") ? 2 : !strcmp(optarg, "cs8") ? 3 : 0; break;
       case 1000: sps = std::atoi(optarg); sps_set = true; break;
       case 's': station = std::atoi(optarg); break;
       case 'o': wav = optarg; break;
@@ -623,19 +623,22 @@ int main(int argc, char** argv) {
 
   // ---- main loop ----
   const size_t kChunk = 1 << 16;                     // samples per read
-  size_t bps = fmt == 1 ? 8 : fmt == 2 ? 2 : 4;      // bytes per sample
+  size_t bps = fmt == 1 ? 8 : (fmt == 2 || fmt == 3) ? 2 : 4;      // bytes per sample
   std::vector<uint8_t> raw(kChunk * bps);
   std::vector<cf> cx(kChunk);
   std::vector<u8> dib;
   size_t carry = 0;
   while (!g_stop) {
+    // Wait for data in 200 ms slices so that Ctrl-C / SIGTERM always take effect.
+    pollfd pf{fd, POLLIN, 0};
+    if (poll(&pf, 1, 200) == 0) continue;
     ssize_t r = io::read_some(fd, raw.data() + carry, raw.size() - carry);
     if (r <= 0) {
       if (!is_tcp || g_stop) break;
       // The encoder went away (or was restarted): keep the decoder alive and reconnect.
       std::fprintf(stderr, "connection lost - reconnecting ...\n");
       close(fd);
-      fd = io::tcp_connect(tcp_host, tcp_port, 3600);
+      fd = io::tcp_connect(tcp_host, tcp_port, 3600, &g_stop);
       if (fd < 0) break;
       std::fprintf(stderr, "reconnected\n");
       carry = 0;
@@ -646,7 +649,8 @@ int main(int argc, char** argv) {
       const uint8_t* p = &raw[k * bps];
       if (fmt == 0)      { int16_t a, b; std::memcpy(&a, p, 2); std::memcpy(&b, p + 2, 2); cx[k] = {a / 32768.f, b / 32768.f}; }
       else if (fmt == 1) { float a, b; std::memcpy(&a, p, 4); std::memcpy(&b, p + 4, 4); cx[k] = {a, b}; }
-      else               { int16_t a; std::memcpy(&a, p, 2); cx[k] = {a / 32768.f, 0.f}; }
+      else if (fmt == 2) { int16_t a; std::memcpy(&a, p, 2); cx[k] = {a / 32768.f, 0.f}; }
+      else               { cx[k] = {static_cast<int8_t>(p[0]) / 128.f, static_cast<int8_t>(p[1]) / 128.f}; }   // cs8
     }
     carry = have - n * bps;
     std::memmove(raw.data(), raw.data() + n * bps, carry);
